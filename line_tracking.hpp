@@ -29,3 +29,6 @@ static constexpr int32 TFT_SHOW_STAGE = 1;
 // 对外：传入摄像头原始灰度图指针，返回底部中心线误差（err_x）
 void line_tracking_process_frame(uint8_t *gray_ptr,
                                  int32 &err_x_out);
+
+// 返回最近一帧的巡线结果（供图传使用）
+const LaneResult &line_tracking_get_last_result();

@@ -12,6 +12,35 @@
 #include "zf_device_uvc.hpp"
 #include "motor_control.hpp"
 #include "line_tracking.hpp"
+#include "remote_video_tx.hpp"
+
+// 上位机 IP 与端口（与 ls2k300_view 配置一致）
+static constexpr const char *REMOTE_VIDEO_IP   = "192.168.1.100";
+static constexpr uint32      REMOTE_VIDEO_PORT  = 19001;
+
+// 将 LaneResult 转换为图传协议所需的 line_extract_result
+static void lane_result_to_extract(const LaneResult &src, line_extract_result &dst)
+{
+    const int lc = (src.left_points_count  < LINE_RESULT_MAX_POINTS)
+                       ? (int)src.left_points_count  : LINE_RESULT_MAX_POINTS;
+    const int rc = (src.right_points_count < LINE_RESULT_MAX_POINTS)
+                       ? (int)src.right_points_count : LINE_RESULT_MAX_POINTS;
+    dst.left_count  = lc;
+    dst.right_count = rc;
+    dst.left_ipm_count  = 0;
+    dst.right_ipm_count = 0;
+    dst.center_ipm_count = 0;
+    for(int i = 0; i < lc; i++)
+    {
+        dst.left_x[i] = (uint16)src.left_points[i].x;
+        dst.left_y[i] = (uint16)src.left_points[i].y;
+    }
+    for(int i = 0; i < rc; i++)
+    {
+        dst.right_x[i] = (uint16)src.right_points[i].x;
+        dst.right_y[i] = (uint16)src.right_points[i].y;
+    }
+}
 
 static bool save_pgm(const char *path, const uint8_t *gray, int w, int h)
 {
@@ -134,6 +163,7 @@ struct vision_worker
     pthread_t tid{};
 
     zf_device_uvc uvc_cam;
+    remote_video_tx video_tx;
 
     static void *thread_entry(void *arg)
     {
@@ -156,6 +186,15 @@ struct vision_worker
             line_tracking_process_frame(gray_ptr, err_x);
             self->latest_err_x.store(err_x);
             self->frame_seq.fetch_add(1);
+
+            // 图传：发送处理后的灰度图及巡线点
+            if(self->video_tx.is_inited())
+            {
+                line_extract_result extract{};
+                lane_result_to_extract(line_tracking_get_last_result(), extract);
+                remote_video_ctrl_meta meta{};
+                self->video_tx.send_gray_frame(gray_ptr, UVC_WIDTH, UVC_HEIGHT, extract, meta);
+            }
         }
 
         return nullptr;
@@ -184,6 +223,17 @@ struct vision_worker
                     std::printf("UVC snapshot save failed.\r\n");
                 }
             }
+        }
+
+        if(0 != video_tx.init(REMOTE_VIDEO_IP, REMOTE_VIDEO_PORT))
+        {
+            std::printf("Remote video TX init failed (IP=%s port=%lu), image streaming disabled.\r\n",
+                        REMOTE_VIDEO_IP, (unsigned long)REMOTE_VIDEO_PORT);
+        }
+        else
+        {
+            std::printf("Remote video TX init OK, target=%s:%lu\r\n",
+                        REMOTE_VIDEO_IP, (unsigned long)REMOTE_VIDEO_PORT);
         }
 
         return 0 == pthread_create(&tid, nullptr, thread_entry, this);

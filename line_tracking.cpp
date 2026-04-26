@@ -1164,3 +1164,7 @@ void line_tracking_process_frame(uint8_t *gray_ptr,
     err_x_out = ((int32)x_avg - (int32)IMAGE_CENTER_X) * (int32)ERR_X_SIGN;
 }
 
+const LaneResult &line_tracking_get_last_result()
+{
+    return g_lane_result;
+}
