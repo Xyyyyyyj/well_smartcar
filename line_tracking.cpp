@@ -62,25 +62,6 @@ struct line_track_features
     int16 right_corner_y = 0;
 };
 
-static void draw_circle_filled(zf_device_ips200 &lcd, int cx, int cy, int r, uint16 color)
-{
-    if(r <= 0) return;
-    for(int dy = -r; dy <= r; ++dy)
-    {
-        const int y = cy + dy;
-        if(y < 0 || y >= (int)LCD_H) continue;
-        const int dx_lim = (int)std::sqrt((double)(r * r - dy * dy));
-        int x0 = cx - dx_lim;
-        int x1 = cx + dx_lim;
-        if(x0 < 0) x0 = 0;
-        if(x1 >= (int)LCD_W) x1 = (int)LCD_W - 1;
-        for(int x = x0; x <= x1; ++x)
-        {
-            lcd.draw_point((uint16)x, (uint16)y, color);
-        }
-    }
-}
-
 static bool fit_line_least_squares(const int *y_arr, const int *x_arr, int n, float &k_out, float &b_out)
 {
     if(n < 2) return false;
@@ -737,7 +718,7 @@ struct LeftRoundaboutSM
 
 static LeftRoundaboutSM g_left_rb_sm;
 // 临时开关：1=关闭左环岛相关逻辑，0=启用
-#define TEMP_DISABLE_LEFT_ROUNDABOUT 0
+#define TEMP_DISABLE_LEFT_ROUNDABOUT 1
 
 } // namespace
 
@@ -993,8 +974,7 @@ static void extract_line_features(const LaneResult &res, line_track_features &f)
     }
 }
 
-void line_tracking_process_frame(zf_device_ips200 &lcd,
-                                 uint8_t *gray_ptr,
+void line_tracking_process_frame(uint8_t *gray_ptr,
                                  int32 &err_x_out)
 {
     err_x_out = 0;
@@ -1019,27 +999,6 @@ void line_tracking_process_frame(zf_device_ips200 &lcd,
     preprocess_run(&g_gray_frame, &g_binary_frame);
     lane_track_eight_neighborhood_run(&g_binary_frame, &g_lane_result);
 
-    // ============== 摄像头采集 + 屏幕显示（缩放） ==============
-    static uint8_t disp_gray[LCD_W * LCD_H];
-    for(uint16 y = 0; y < LCD_H; y++)
-    {
-        const uint16 y_s = (uint16)((uint32)y * (uint32)UVC_HEIGHT / (uint32)LCD_H);
-        for(uint16 x = 0; x < LCD_W; x++)
-        {
-            const uint16 x_s = (uint16)((uint32)x * (uint32)UVC_WIDTH / (uint32)LCD_W);
-            disp_gray[y * LCD_W + x] = g_binary_frame.data[y_s][x_s];
-        }
-    }
-
-    // 关键：show_gray_image 里真正用的是 width/height，不是 dis_width/dis_height
-    // 所以这里 width/height 必须传 LCD 的大小，才能把画面“铺满”
-    lcd.show_gray_image(0, 0,
-                        disp_gray,
-                        LCD_W,
-                        LCD_H,
-                        LCD_W,
-                        LCD_H,
-                        0);   // threshold = 0 表示按灰度显示
     line_track_features features{};
     extract_line_features(g_lane_result, features);
 
@@ -1174,131 +1133,10 @@ void line_tracking_process_frame(zf_device_ips200 &lcd,
     }
 #endif
 
-    // ============== 在屏幕上叠加：赛道边界 + 中心拟合线 ==============
-    // 算法坐标：160x120（宽x高）；屏幕显示的是摄像头原始 160x120 图像。
-    // 映射关系（算法点 -> 原图点）：(x_alg, y_alg) -> (x_src = x_alg, y_src = y_alg)
+    // ============== 中线误差统计窗口 ==============
     // err_x 统计窗口固定为 100±3 行
     const int row_begin = (int)clamp_int32(100 - 3, 0, IMAGE_HEIGHT - 1);
     const int row_end = (int)clamp_int32(100 + 3, row_begin, IMAGE_HEIGHT - 1);
-    // 左环岛判定窗口边界（从下往上第5~100行）：在屏幕上标蓝线，便于调试
-    const int win_row_hi = (int)clamp_int32((IMAGE_HEIGHT - 1) - 5, 0, IMAGE_HEIGHT - 1);
-    const int win_row_lo = (int)clamp_int32((IMAGE_HEIGHT - 1) - 100, 0, win_row_hi);
-    // row_begin 是算法的 y，在屏幕上表现为一条横线
-    const uint16 y_lcd_row_begin = (uint16)((uint32)row_begin * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-    const uint16 y_lcd_win_hi = (uint16)((uint32)win_row_hi * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-    const uint16 y_lcd_win_lo = (uint16)((uint32)win_row_lo * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-    for(uint16 x = 0; x < LCD_W; ++x)
-    {
-        lcd.draw_point(x, y_lcd_row_begin, RGB565_YELLOW);
-        lcd.draw_point(x, y_lcd_win_hi, RGB565_BLUE);
-        lcd.draw_point(x, y_lcd_win_lo, RGB565_BLUE);
-    }
-
-    bool have_prev_supp = false;
-    uint16 prev_supp_x = 0;
-    uint16 prev_supp_y = 0;
-    for(int row = 0; row < IMAGE_HEIGHT; ++row) // row: y_alg
-    {
-        const uint16 y_lcd = (uint16)((uint32)row * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        const uint16 x_lcd_l = (uint16)((uint32)g_lane_result.left_border[row] * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 x_lcd_r = (uint16)((uint32)g_lane_result.right_border[row] * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const bool in_fit_win = have_supp_and_fit && (row >= fit_y0) && (row <= fit_y1);
-        const uint8 center_to_draw = in_fit_win ? center_fit[row] : g_lane_result.center_line[row];
-        const uint16 x_lcd_c = (uint16)((uint32)center_to_draw * (uint32)LCD_W / (uint32)UVC_WIDTH);
-
-        // 将显示宽度调整为当前实现的5倍：2px -> 10px
-        const int32 half = LCD_DRAW_LINE_WIDTH / 2;
-        for(int32 dx = -half; dx < (LCD_DRAW_LINE_WIDTH - half); ++dx)
-        {
-            const int32 xl = (int32)x_lcd_l + dx;
-            const int32 xr = (int32)x_lcd_r + dx;
-            const int32 xc = (int32)x_lcd_c + dx;
-
-            if(xl >= 0 && xl < LCD_W) lcd.draw_point((uint16)xl, y_lcd, RGB565_GREEN);
-            if(xr >= 0 && xr < LCD_W) lcd.draw_point((uint16)xr, y_lcd, RGB565_RED);
-            // 清除区间内原本的中线：区间内只画“新拟合中线”，区间外画原中线
-            if(xc >= 0 && xc < LCD_W) lcd.draw_point((uint16)xc, y_lcd, in_fit_win ? RGB565_PURPLE : RGB565_CYAN);
-        }
-
-        // 补线右边界：黑色（仅在拟合窗口内有效）
-        if(in_fit_win && supp_right[row] >= 0)
-        {
-            const uint16 x_lcd_supp_r = (uint16)((uint32)supp_right[row] * (uint32)LCD_W / (uint32)UVC_WIDTH);
-            // 用相邻点连线，显示为连续补线
-            if(have_prev_supp)
-            {
-                lcd.draw_line(prev_supp_x, prev_supp_y, x_lcd_supp_r, y_lcd, RGB565_BLACK);
-            }
-            prev_supp_x = x_lcd_supp_r;
-            prev_supp_y = y_lcd;
-            have_prev_supp = true;
-        }
-        else
-        {
-            // 断开补线连线状态，避免跨空洞/跨窗口连接
-            have_prev_supp = false;
-        }
-    }
-
-    if(features.left_corner_flag)
-    {
-        const uint16 x_lcd = (uint16)((uint32)features.left_corner_x * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 y_lcd = (uint16)((uint32)features.left_corner_y * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        lcd.draw_point(x_lcd, y_lcd, RGB565_WHITE);
-    }
-    if(features.right_corner_flag)
-    {
-        const uint16 x_lcd = (uint16)((uint32)features.right_corner_x * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 y_lcd = (uint16)((uint32)features.right_corner_y * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        lcd.draw_point(x_lcd, y_lcd, RGB565_WHITE);
-    }
-    // 注意：点识别/补线/拟合已提前到叠加绘制前，这里只负责画点位标记
-#if !TEMP_DISABLE_LEFT_ROUNDABOUT
-    if(g_left_rb_sm.p1_found)
-    {
-        const uint16 x_lcd = (uint16)((uint32)g_left_rb_sm.p1_x * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 y_lcd = (uint16)((uint32)g_left_rb_sm.p1_y * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        left_rb_printf("[LEFT_RB][P1_DRAW] p1=(x=%d,y=%d) lcd=(x=%u,y=%u)\r\n",
-                       g_left_rb_sm.p1_x, g_left_rb_sm.p1_y, (unsigned)x_lcd, (unsigned)y_lcd);
-        draw_circle_filled(lcd, (int)x_lcd, (int)y_lcd, 6, RGB565_YELLOW);
-    }
-    if(g_left_rb_sm.p2_found)
-    {
-        const uint16 x_lcd = (uint16)((uint32)g_left_rb_sm.p2_x * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 y_lcd = (uint16)((uint32)g_left_rb_sm.p2_y * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        draw_circle_filled(lcd, (int)x_lcd, (int)y_lcd, 6, RGB565_YELLOW);
-    }
-    if(g_left_rb_sm.p3_found)
-    {
-        const uint16 x_lcd = (uint16)((uint32)g_left_rb_sm.p3_x * (uint32)LCD_W / (uint32)UVC_WIDTH);
-        const uint16 y_lcd = (uint16)((uint32)g_left_rb_sm.p3_y * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-        draw_circle_filled(lcd, (int)x_lcd, (int)y_lcd, 6, RGB565_YELLOW);
-    }
-#endif
-
-
-    // 起始点标记（可选）
-    if(g_lane_result.start_found)
-    {
-        const int lsx = (int)g_lane_result.left_start.x;
-        const int lsy = (int)g_lane_result.left_start.y;
-        const int rsx = (int)g_lane_result.right_start.x;
-        const int rsy = (int)g_lane_result.right_start.y;
-
-        // start 点坐标同样是算法坐标，映射到屏幕显示坐标
-        if(lsx >= 0 && lsy >= 0)
-        {
-            const uint16 x_lcd = (uint16)((uint32)lsx * (uint32)LCD_W / (uint32)UVC_WIDTH);
-            const uint16 y_lcd = (uint16)((uint32)lsy * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-            lcd.draw_point(x_lcd, y_lcd, RGB565_YELLOW);
-        }
-        if(rsx >= 0 && rsy >= 0)
-        {
-            const uint16 x_lcd = (uint16)((uint32)rsx * (uint32)LCD_W / (uint32)UVC_WIDTH);
-            const uint16 y_lcd = (uint16)((uint32)rsy * (uint32)LCD_H / (uint32)UVC_HEIGHT);
-            lcd.draw_point(x_lcd, y_lcd, RGB565_YELLOW);
-        }
-    }
 
     // 调试输出：打印第70行左右边界（限频，避免串口刷屏）
     static uint32 debug_print_div = 0;

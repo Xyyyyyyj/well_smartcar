@@ -10,7 +10,6 @@
 #include <cstdlib>
 #include <time.h>
 #include "zf_device_uvc.hpp"
-#include "zf_device_ips200_fb.hpp"
 #include "motor_control.hpp"
 #include "line_tracking.hpp"
 
@@ -40,21 +39,18 @@ static constexpr int32 ENCODER_COUNTS_PER_REV = 1024;
 // 轮速外环基准目标转速（rpm）
 static constexpr int32 TARGET_RPM_BASE = 1000;
 
-static constexpr int32 PWM_DUTY_LIMIT_PERCENT_NUM = 100;
-static constexpr int32 PWM_DUTY_LIMIT_PERCENT_DEN = 100;
+static constexpr float PWM_DUTY_LIMIT_PERCENT = 100.0f;
 
 static constexpr bool  USE_MANUAL_PWM = false;
-static constexpr int32 MANUAL_DUTY_PERCENT_L = 10;
-static constexpr int32 MANUAL_DUTY_PERCENT_R = 10;
+static constexpr float MANUAL_DUTY_PERCENT_L = 10.0f;
+static constexpr float MANUAL_DUTY_PERCENT_R = 10.0f;
 
 static constexpr float SPEED_KP = 5.0f;
 static constexpr float SPEED_KI = 5.0f;
 static constexpr float SPEED_LOOP_DIV = 100000.0f;
 static constexpr float SPEED_INTEGRAL_LIMIT = 500000.0f;
-static constexpr float REVERSE_BRAKE_START_OVERSPEED_RPM = 100.0f;
-static constexpr float REVERSE_BRAKE_FULL_OVERSPEED_RPM = 1000.0f;
-static constexpr float REVERSE_BRAKE_MIN_TARGET_RATIO = 0.05f;
-static constexpr float REVERSE_BRAKE_MAX_TARGET_RATIO = 0.10f;
+// 反向制动由 PI 直接输出负占空比（smartcar 同风格），仅限制反向占空比下限比例
+static constexpr float REVERSE_BRAKE_DUTY_LIMIT_SCALE = 0.20f;
 
 // =============================== 巡线转角合成 → 轮速差速 ===============================
 // 转角值（映射为 steer_rpm_imu，单位与左右目标 rpm 同）：需整定
@@ -63,29 +59,21 @@ static constexpr int32 STEER_RPM_MAX = 5000;
 
 // =============================== 弯道/直道状态判断 + 分模式转角参数 ===============================
 // |err_x| 小于阈值认为该帧“更像直道”，否则更像弯道；使用多帧去抖做状态切换。
-static constexpr int32 STRAIGHT_ERR_X_THRESHOLD = 10;
+static constexpr float STRAIGHT_ERR_X_THRESHOLD = 10.0f;
 static constexpr int32 STRAIGHT_ENTER_FRAMES = 5; // 连续满足直道帧数，切入直道
 static constexpr int32 CURVE_ENTER_FRAMES = 2;    // 连续满足弯道帧数，切入弯道
 
 // 直道转角参数（更保守）
-static constexpr int32 STEER_STRAIGHT_KP_NUM  = 20;
-static constexpr int32 STEER_STRAIGHT_KP_DEN  = 1;
-static constexpr int32 STEER_STRAIGHT_KP2_NUM = 1;
-static constexpr int32 STEER_STRAIGHT_KP2_DEN = 1;
-static constexpr int32 STEER_STRAIGHT_KD_NUM  = 0;
-static constexpr int32 STEER_STRAIGHT_KD_DEN  = 1;
-static constexpr int32 STEER_STRAIGHT_GKD_NUM = 8;
-static constexpr int32 STEER_STRAIGHT_GKD_DEN = 10;
+static constexpr float STEER_STRAIGHT_KP  = 20.0f;
+static constexpr float STEER_STRAIGHT_KP2 = 1.0f;
+static constexpr float STEER_STRAIGHT_KD  = 0.0f;
+static constexpr float STEER_STRAIGHT_GKD = 0.8f;
 
 // 弯道转角参数（沿用当前参数）
-static constexpr int32 STEER_CURVE_KP_NUM  = 30;
-static constexpr int32 STEER_CURVE_KP_DEN  = 1;
-static constexpr int32 STEER_CURVE_KP2_NUM = 2;
-static constexpr int32 STEER_CURVE_KP2_DEN = 1;
-static constexpr int32 STEER_CURVE_KD_NUM  = 0;
-static constexpr int32 STEER_CURVE_KD_DEN  = 1;
-static constexpr int32 STEER_CURVE_GKD_NUM = 10;
-static constexpr int32 STEER_CURVE_GKD_DEN = 10;
+static constexpr float STEER_CURVE_KP  = 30.0f;
+static constexpr float STEER_CURVE_KP2 = 2.0f;
+static constexpr float STEER_CURVE_KD  = 0.0f;
+static constexpr float STEER_CURVE_GKD = 1.0f;
 
 // 控制环固定周期（用于速度推算）
 static constexpr int32 CONTROL_PERIOD_MS = 10;
@@ -145,7 +133,6 @@ struct vision_worker
     std::atomic<uint32> frame_seq{0};
     pthread_t tid{};
 
-    zf_device_ips200 lcd;
     zf_device_uvc uvc_cam;
 
     static void *thread_entry(void *arg)
@@ -166,7 +153,7 @@ struct vision_worker
             }
 
             int32 err_x = 0;
-            line_tracking_process_frame(self->lcd, gray_ptr, err_x);
+            line_tracking_process_frame(gray_ptr, err_x);
             self->latest_err_x.store(err_x);
             self->frame_seq.fetch_add(1);
         }
@@ -176,9 +163,6 @@ struct vision_worker
 
     bool start()
     {
-        lcd.init("/dev/fb0", 1);
-        lcd.clear();
-
         if(0 != uvc_cam.init("/dev/video0"))
         {
             return false;
@@ -229,9 +213,9 @@ static int32 encoder_delta_to_rpm(int32 delta_count, uint32 dt_us)
 
 struct inc_pi_state
 {
-    float u{0.0f};     // 上一次输出（占空比命令）
-    float e1{0.0f};    // 上一次误差
-    float i_acc{0.0f}; // 误差积分累加（限幅）
+    float u{0.0f};      // 上一次输出（占空比命令）
+    float e1{0.0f};     // 上一次误差
+    float i_acc{0.0f};  // 误差积分累加（限幅）
 };
 
 enum class road_mode : uint8_t
@@ -250,7 +234,7 @@ struct road_mode_sm
     road_mode update(int32 err_x)
     {
         const int64 abs_err = (int64)std::llabs((long long)err_x);
-        const bool straight_like = (abs_err <= (int64)STRAIGHT_ERR_X_THRESHOLD);
+        const bool straight_like = ((float)abs_err <= STRAIGHT_ERR_X_THRESHOLD);
         if(straight_like)
         {
             if(straight_like_count < INT32_MAX) straight_like_count++;
@@ -276,85 +260,29 @@ struct road_mode_sm
 
 // 增量式 PI：
 // u(k) = u(k-1) + Kp*(e(k)-e(k-1)) + Ki*e(k)
-// 与 smartcar_ls2k300 的实现保持一致：浮点增量 PI。
+// 这里 Kp/Ki 与 SPEED_LOOP_DIV 配合做定点缩放；采样周期固定 10ms，因此 Ki 需按该周期整定。
 static int32 speed_inc_pi_output(int32 target_rpm, int32 actual_rpm, inc_pi_state &st, int32 max_duty)
 {
     const float e = (float)(target_rpm - actual_rpm);
     const float de = e - st.e1;
+
     float i_new = st.i_acc + e;
     if(i_new > SPEED_INTEGRAL_LIMIT) i_new = SPEED_INTEGRAL_LIMIT;
     if(i_new < -SPEED_INTEGRAL_LIMIT) i_new = -SPEED_INTEGRAL_LIMIT;
     const float di = i_new - st.i_acc;
+
     const float du = (SPEED_KP * de + SPEED_KI * di) * ((float)max_duty / SPEED_LOOP_DIV);
     float u_new = st.u + du;
-    if(u_new < 0.0f) u_new = 0.0f;
+
+    // 与 smartcar 一致：PI 允许有限反向输出，实现“PI 控制的反向制动”
+    const float u_min = -(float)max_duty * REVERSE_BRAKE_DUTY_LIMIT_SCALE;
+    if(u_new < u_min) u_new = u_min;
     if(u_new > (float)max_duty) u_new = (float)max_duty;
 
     st.i_acc = i_new;
     st.u = u_new;
     st.e1 = e;
-    return (int32)(u_new + 0.5f);
-}
-
-static int32 speed_inc_pi_output_signed(int32 target_rpm, int32 actual_rpm, inc_pi_state &st, int32 max_duty)
-{
-    const float e = (float)(target_rpm - actual_rpm);
-    const float de = e - st.e1;
-    float i_new = st.i_acc + e;
-    if(i_new > SPEED_INTEGRAL_LIMIT) i_new = SPEED_INTEGRAL_LIMIT;
-    if(i_new < -SPEED_INTEGRAL_LIMIT) i_new = -SPEED_INTEGRAL_LIMIT;
-    const float di = i_new - st.i_acc;
-    const float du = (SPEED_KP * de + SPEED_KI * di) * ((float)max_duty / SPEED_LOOP_DIV);
-    float u_new = st.u + du;
-    if(u_new < -(float)max_duty) u_new = -(float)max_duty;
-    if(u_new > (float)max_duty) u_new = (float)max_duty;
-
-    st.i_acc = i_new;
-    st.u = u_new;
-    st.e1 = e;
-    return (int32)((u_new >= 0.0f) ? (u_new + 0.5f) : (u_new - 0.5f));
-}
-
-static void reset_inc_pi_state(inc_pi_state &st)
-{
-    st.u = 0.0f;
-    st.e1 = 0.0f;
-    st.i_acc = 0.0f;
-}
-
-static int32 apply_reverse_brake_with_pi(int32 pi_duty_cmd,
-                                         int32 target_rpm,
-                                         int32 actual_rpm,
-                                         int32 max_duty,
-                                         inc_pi_state &brake_pi_state)
-{
-    int32 cmd = clamp_int32(pi_duty_cmd, 0, max_duty);
-    const float overspeed_rpm = (float)(actual_rpm - target_rpm);
-    if(overspeed_rpm < REVERSE_BRAKE_START_OVERSPEED_RPM)
-    {
-        reset_inc_pi_state(brake_pi_state);
-        return cmd;
-    }
-
-    float brake_ratio = REVERSE_BRAKE_MAX_TARGET_RATIO;
-    if(overspeed_rpm <= REVERSE_BRAKE_FULL_OVERSPEED_RPM)
-    {
-        const float overspeed_range = REVERSE_BRAKE_FULL_OVERSPEED_RPM - REVERSE_BRAKE_START_OVERSPEED_RPM;
-        const float ratio_range = REVERSE_BRAKE_MAX_TARGET_RATIO - REVERSE_BRAKE_MIN_TARGET_RATIO;
-        brake_ratio = REVERSE_BRAKE_MIN_TARGET_RATIO +
-                      (overspeed_rpm - REVERSE_BRAKE_START_OVERSPEED_RPM) * ratio_range / overspeed_range;
-    }
-    if(brake_ratio < REVERSE_BRAKE_MIN_TARGET_RATIO) brake_ratio = REVERSE_BRAKE_MIN_TARGET_RATIO;
-    if(brake_ratio > REVERSE_BRAKE_MAX_TARGET_RATIO) brake_ratio = REVERSE_BRAKE_MAX_TARGET_RATIO;
-
-    // 由反向目标转速驱动 PI，而不是直接给固定反向占空比。
-    const int32 brake_target_rpm = -(int32)((float)target_rpm * brake_ratio + 0.5f);
-    const int32 reverse_brake_cmd = speed_inc_pi_output_signed(brake_target_rpm, actual_rpm, brake_pi_state, max_duty);
-    if(reverse_brake_cmd < 0)
-    {
-        cmd = reverse_brake_cmd;
-    }
-    return cmd;
+    return (u_new >= 0.0f) ? (int32)(u_new + 0.5f) : (int32)(u_new - 0.5f);
 }
 
 int main(int, char**)
@@ -371,13 +299,11 @@ int main(int, char**)
 
     two_motor_driver motors;
     motors.init();
-    const int32 max_duty_left = (int32)((int64)motors.duty_max_left() * (int64)PWM_DUTY_LIMIT_PERCENT_NUM / (int64)PWM_DUTY_LIMIT_PERCENT_DEN);
-    const int32 max_duty_right = (int32)((int64)motors.duty_max_right() * (int64)PWM_DUTY_LIMIT_PERCENT_NUM / (int64)PWM_DUTY_LIMIT_PERCENT_DEN);
+    const int32 max_duty_left = (int32)((float)motors.duty_max_left() * (PWM_DUTY_LIMIT_PERCENT / 100.0f));
+    const int32 max_duty_right = (int32)((float)motors.duty_max_right() * (PWM_DUTY_LIMIT_PERCENT / 100.0f));
 
     inc_pi_state pi_left{};
     inc_pi_state pi_right{};
-    inc_pi_state brake_pi_left{};
-    inc_pi_state brake_pi_right{};
     int32 duty_left = 0;
     int32 duty_right = 0;
     int32 duty_cmd_left = 0;
@@ -438,35 +364,27 @@ int main(int, char**)
         const int64 abs_err = (int64)std::llabs((long long)err_x);
         const road_mode mode = road_sm.update(err_x);
 
-        int32 kp_num = STEER_STRAIGHT_KP_NUM;
-        int32 kp_den = STEER_STRAIGHT_KP_DEN;
-        int32 kp2_num = STEER_STRAIGHT_KP2_NUM;
-        int32 kp2_den = STEER_STRAIGHT_KP2_DEN;
-        int32 kd_num = STEER_STRAIGHT_KD_NUM;
-        int32 kd_den = STEER_STRAIGHT_KD_DEN;
-        int32 gkd_num = STEER_STRAIGHT_GKD_NUM;
-        int32 gkd_den = STEER_STRAIGHT_GKD_DEN;
+        float kp = STEER_STRAIGHT_KP;
+        float kp2 = STEER_STRAIGHT_KP2;
+        float kd = STEER_STRAIGHT_KD;
+        float gkd = STEER_STRAIGHT_GKD;
         if(mode == road_mode::CURVE)
         {
-            kp_num = STEER_CURVE_KP_NUM;
-            kp_den = STEER_CURVE_KP_DEN;
-            kp2_num = STEER_CURVE_KP2_NUM;
-            kp2_den = STEER_CURVE_KP2_DEN;
-            kd_num = STEER_CURVE_KD_NUM;
-            kd_den = STEER_CURVE_KD_DEN;
-            gkd_num = STEER_CURVE_GKD_NUM;
-            gkd_den = STEER_CURVE_GKD_DEN;
+            kp = STEER_CURVE_KP;
+            kp2 = STEER_CURVE_KP2;
+            kd = STEER_CURVE_KD;
+            gkd = STEER_CURVE_GKD;
         }
 
-        int64 turn = err_x64 * (int64)kp_num / (int64)kp_den +
-                     err_x64 * abs_err * (int64)kp2_num / (int64)kp2_den +
-                     (int64)d_err_x * (int64)kd_num / (int64)kd_den;
+        float turn = (float)err_x64 * kp +
+                     (float)(err_x64 * abs_err) * kp2 +
+                     (float)d_err_x * kd;
         if(imu_ok)
         {
-            turn += (int64)gyro_z * (int64)gkd_num / (int64)gkd_den;
+            turn += (float)gyro_z * gkd;
         }
 
-        int32 steer_rpm_imu = clamp_int32((int32)turn, -STEER_RPM_MAX, STEER_RPM_MAX);
+        int32 steer_rpm_imu = clamp_int32((int32)std::lround(turn), -STEER_RPM_MAX, STEER_RPM_MAX);
 
         int32 target_rpm_left = base_rpm + steer_rpm_imu;
         int32 target_rpm_right = base_rpm - steer_rpm_imu;
@@ -494,10 +412,10 @@ int main(int, char**)
 
         if(USE_MANUAL_PWM)
         {
-            duty_left = (int32)((int64)motors.duty_max_left() * (int64)MANUAL_DUTY_PERCENT_L / 100LL);
-            duty_right = (int32)((int64)motors.duty_max_right() * (int64)MANUAL_DUTY_PERCENT_R / 100LL);
-            duty_left = clamp_int32(duty_left, 0, max_duty_left);
-            duty_right = clamp_int32(duty_right, 0, max_duty_right);
+            duty_left = (int32)((float)motors.duty_max_left() * (MANUAL_DUTY_PERCENT_L / 100.0f));
+            duty_right = (int32)((float)motors.duty_max_right() * (MANUAL_DUTY_PERCENT_R / 100.0f));
+            duty_left = clamp_int32(duty_left, -(int32)((float)max_duty_left * REVERSE_BRAKE_DUTY_LIMIT_SCALE), max_duty_left);
+            duty_right = clamp_int32(duty_right, -(int32)((float)max_duty_right * REVERSE_BRAKE_DUTY_LIMIT_SCALE), max_duty_right);
         }
         else
         {
@@ -505,18 +423,8 @@ int main(int, char**)
             duty_right = speed_inc_pi_output(target_rpm_right, rpm_right, pi_right, max_duty_right);
         }
 
-        if(mode == road_mode::CURVE)
-        {
-            duty_cmd_left = apply_reverse_brake_with_pi(duty_left, target_rpm_left, rpm_left, max_duty_left, brake_pi_left);
-            duty_cmd_right = apply_reverse_brake_with_pi(duty_right, target_rpm_right, rpm_right, max_duty_right, brake_pi_right);
-        }
-        else
-        {
-            reset_inc_pi_state(brake_pi_left);
-            reset_inc_pi_state(brake_pi_right);
-            duty_cmd_left = duty_left;
-            duty_cmd_right = duty_right;
-        }
+        duty_cmd_left = duty_left;
+        duty_cmd_right = duty_right;
         motors.set_speed_duty(duty_cmd_left, duty_cmd_right);
 
         timespec now_ts{};

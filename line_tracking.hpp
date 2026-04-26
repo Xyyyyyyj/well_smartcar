@@ -1,7 +1,6 @@
 #pragma once
 
 #include "zf_common_headfile.hpp"
-#include "zf_device_ips200_fb.hpp"
 #include "lane_types.h"
 #include "preprocess.h"
 #include "lane_track_eight_neighborhood.h"
@@ -27,7 +26,6 @@ static constexpr int32 ERR_X_SIGN = 1;
 // 1：显示开闭运算 + 连通域去噪 + 清边界后的二值图（preprocess_run 输出）
 static constexpr int32 TFT_SHOW_STAGE = 1;
 
-// 对外：传入摄像头原始灰度图指针，在 LCD 上叠加赛道信息，并返回底部中心线误差（err_x）
-void line_tracking_process_frame(zf_device_ips200 &lcd,
-                                 uint8_t *gray_ptr,
+// 对外：传入摄像头原始灰度图指针，返回底部中心线误差（err_x）
+void line_tracking_process_frame(uint8_t *gray_ptr,
                                  int32 &err_x_out);
